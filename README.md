@@ -10,6 +10,13 @@ go build
 ./cards-server -addr :7777
 ```
 
+Or with Docker:
+
+```
+docker build -t cards-server .
+docker run -d -p 7777:7777 cards-server
+```
+
 ## License
 
 AGPLv3, see [LICENSE](LICENSE).
