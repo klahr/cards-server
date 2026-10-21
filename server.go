@@ -19,8 +19,11 @@ const (
 	maxLine     = 64 << 10 // longest message a client may send
 	maxActs     = 20000    // longest log a game may grow to
 	maxGames    = 500
+	maxSeats    = 5
 	maxName     = 24
-	readTimeout = 90 * time.Second // clients ping every 30 seconds
+	readTimeout = 45 * time.Second // clients ping every 15 seconds
+	// How long a seat is held for a player whose connection dropped before the start.
+	grace = 2 * time.Minute
 )
 
 var (
@@ -69,6 +72,8 @@ type seat struct {
 	// A bot plays for the player while they are away.
 	bot  bool
 	conn *client
+	// When the player's connection dropped.
+	gone time.Time
 }
 
 type client struct {
@@ -103,14 +108,30 @@ func (s *server) serve(l net.Listener) error {
 	}
 }
 
-// Drops started games nobody has come back to.
+// Drops started games nobody has come back to, and frees the seats of
+// players who dropped before the start and did not come back in time.
 func (s *server) collect() {
-	for range time.Tick(time.Minute) {
+	for range time.Tick(15 * time.Second) {
 		s.mu.Lock()
 		changed := map[string]bool{}
 		for id, g := range s.games {
 			if !g.empty.IsZero() && time.Since(g.empty) > s.idle {
 				delete(s.games, id)
+				changed[g.kind] = true
+				continue
+			}
+			if g.started {
+				continue
+			}
+			freed := false
+			for i, st := range g.seats {
+				if st.token != "" && st.conn == nil && time.Since(st.gone) > grace {
+					s.free(g, i)
+					freed = true
+				}
+			}
+			if freed {
+				s.sendTable(g)
 				changed[g.kind] = true
 			}
 		}
@@ -187,7 +208,7 @@ func (s *server) close(c *client) {
 	if c.closed {
 		return
 	}
-	s.leave(c)
+	s.leave(c, false)
 	c.closed = true
 	close(c.out)
 	delete(s.clients, c)
@@ -227,7 +248,7 @@ func (s *server) handle(c *client, m *msg) bool {
 			s.sendLobbies(g.kind)
 		}
 	case "create":
-		if m.Seats < 2 || m.Seats > 4 {
+		if m.Seats < 2 || m.Seats > maxSeats {
 			c.fail("bad seats")
 			break
 		}
@@ -235,7 +256,7 @@ func (s *server) handle(c *client, m *msg) bool {
 			c.fail("server full")
 			break
 		}
-		s.leave(c)
+		s.leave(c, true)
 		g := &game{
 			id:       s.newID(),
 			kind:     c.kind,
@@ -249,7 +270,7 @@ func (s *server) handle(c *client, m *msg) bool {
 	case "join":
 		s.join(c, m)
 	case "leave":
-		s.leave(c)
+		s.leave(c, true)
 		c.send(s.lobby(c))
 	case "start":
 		g := c.game
@@ -302,7 +323,7 @@ func (s *server) join(c *client, m *msg) {
 	for i, st := range g.seats {
 		if st.token == c.token {
 			// Your own seat: no password needed to come back.
-			s.leave(c)
+			s.leave(c, true)
 			s.sit(c, g, i)
 			return
 		}
@@ -318,7 +339,7 @@ func (s *server) join(c *client, m *msg) {
 		c.fail("game full")
 		return
 	}
-	s.leave(c)
+	s.leave(c, true)
 	s.sit(c, g, free)
 }
 
@@ -335,9 +356,10 @@ func (s *server) sit(c *client, g *game, i int) {
 	s.sendLobbies(g.kind)
 }
 
-// Takes the client from its table. Before the start the seat is freed; after
-// it, the seat is kept for the player to come back to.
-func (s *server) leave(c *client) {
+// Takes the client from its table. A player who leaves before the start
+// frees the seat; one whose connection dropped keeps it for a while. After the
+// start, the seat is kept for the player to come back to.
+func (s *server) leave(c *client, explicit bool) {
 	g := c.game
 	if g == nil {
 		return
@@ -345,25 +367,33 @@ func (s *server) leave(c *client) {
 	c.game = nil
 	st := &g.seats[c.seat]
 	st.conn = nil
-	if !g.started {
-		*st = seat{}
-		if g.owner == c.token {
-			g.owner = ""
-			for _, o := range g.seats {
-				if o.token != "" {
-					g.owner = o.token
-					break
-				}
-			}
-		}
-		if g.owner == "" {
-			delete(s.games, g.id)
-		}
-	} else if s.online(g) == 0 {
+	st.gone = time.Now()
+	if !g.started && explicit {
+		s.free(g, c.seat)
+	} else if s.online(g) == 0 && g.started {
 		g.empty = time.Now()
 	}
 	s.sendTable(g)
 	s.sendLobbies(g.kind)
+}
+
+// Empties a seat before the start, passing the table on if its creator goes
+// and dropping it once no one is left.
+func (s *server) free(g *game, i int) {
+	token := g.seats[i].token
+	g.seats[i] = seat{}
+	if g.owner == token {
+		g.owner = ""
+		for _, o := range g.seats {
+			if o.token != "" {
+				g.owner = o.token
+				break
+			}
+		}
+	}
+	if g.owner == "" {
+		delete(s.games, g.id)
+	}
 }
 
 func (s *server) online(g *game) int {

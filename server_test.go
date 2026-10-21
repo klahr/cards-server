@@ -154,3 +154,28 @@ func TestOwnerLeavesBeforeStart(t *testing.T) {
 		t.Fatalf("games %v", games)
 	}
 }
+
+func TestDropBeforeStartKeepsSeat(t *testing.T) {
+	addr := start(t)
+	alice, aliceToken := dial(t, addr, "Alice", "")
+	bob, _ := dial(t, addr, "Bob", "")
+
+	alice.send(map[string]any{"t": "create", "seats": 2})
+	alice.expect("table")
+	id := bob.expect("lobby")["games"].([]any)[0].(map[string]any)["id"]
+
+	// Alice's connection drops: the game and her seat wait for her.
+	alice.nc.Close()
+	lobby := bob.until("lobby", func(m map[string]any) bool { return len(m["games"].([]any)) == 1 })
+	bob.send(map[string]any{"t": "join", "id": id})
+	if s := bob.expect("table")["seat"].(float64); s != 1 {
+		t.Fatalf("bob in seat %v, lobby %v", s, lobby)
+	}
+
+	alice, _ = dial(t, addr, "Alice", aliceToken)
+	alice.send(map[string]any{"t": "join", "id": id})
+	table := alice.expect("table")
+	if table["seat"].(float64) != 0 || table["admin"].(float64) != 0 {
+		t.Fatalf("rejoined %v", table)
+	}
+}
