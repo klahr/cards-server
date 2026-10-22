@@ -10,6 +10,10 @@ go build
 ./cards-server -addr :7777
 ```
 
+Apps send their version when they connect. One older than `-min-version` is told to
+update and let go: `-min-version 2` for every game, or `-min-version 1,hearts=2` to
+raise it for one game only. The default is 1.
+
 Or with Docker:
 
 ```

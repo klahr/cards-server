@@ -20,7 +20,7 @@ func start(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go newServer(time.Hour).serve(l)
+	go newServer(time.Hour, minVersions{all: 1, game: map[string]int{"bridge": 2}}).serve(l)
 	return l.Addr().String()
 }
 
@@ -31,7 +31,7 @@ func dial(t *testing.T, addr, name, token string) (*testClient, string) {
 	}
 	t.Cleanup(func() { nc.Close() })
 	c := &testClient{t: t, nc: nc, r: bufio.NewReader(nc)}
-	c.send(map[string]any{"t": "hello", "game": "hearts", "name": name, "token": token})
+	c.send(map[string]any{"t": "hello", "game": "hearts", "v": 1, "name": name, "token": token})
 	w := c.expect("welcome")
 	c.expect("lobby")
 	return c, w["token"].(string)
@@ -216,5 +216,42 @@ func TestInvite(t *testing.T) {
 	h.send(map[string]any{"t": "join", "id": table["id"]})
 	if msg := h.expect("error")["msg"]; msg != "wrong password" {
 		t.Fatalf("error %v", msg)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	addr := start(t)
+	hello := func(game string, v int) *testClient {
+		nc, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { nc.Close() })
+		c := &testClient{t: t, nc: nc, r: bufio.NewReader(nc)}
+		c.send(map[string]any{"t": "hello", "game": game, "v": v})
+		return c
+	}
+	// No version at all, and too old for a game with its own minimum.
+	for _, c := range []*testClient{hello("hearts", 0), hello("bridge", 1)} {
+		if msg := c.expect("error")["msg"]; msg != "update" {
+			t.Fatalf("error %v", msg)
+		}
+		if _, err := c.r.ReadBytes('\n'); err == nil {
+			t.Fatal("still connected")
+		}
+	}
+	hello("bridge", 2).expect("welcome")
+	hello("hearts", 1).expect("welcome")
+}
+
+func TestParseMinVersions(t *testing.T) {
+	mv, err := parseMinVersions("1, hearts=3")
+	if err != nil || mv.of("hearts") != 3 || mv.of("bridge") != 1 {
+		t.Fatalf("%v %v", mv, err)
+	}
+	for _, bad := range []string{"x", "hearts=", "Hearts=2", "-1"} {
+		if _, err := parseMinVersions(bad); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
 	}
 }

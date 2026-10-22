@@ -6,10 +6,12 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,7 @@ type msg struct {
 	Seat     int             `json:"seat,omitempty"`
 	On       bool            `json:"on,omitempty"`
 	Hidden   bool            `json:"hidden,omitempty"`
+	V        int             `json:"v,omitempty"` // the app's version of the protocol and its moves
 	A        json.RawMessage `json:"a,omitempty"`
 }
 
@@ -56,6 +59,46 @@ type server struct {
 	clients map[*client]struct{}
 	// How long a started game is kept once nobody is at the table.
 	idle time.Duration
+	// The oldest app version let in.
+	min minVersions
+}
+
+// The oldest app version let in for every game, and for some games on their own.
+type minVersions struct {
+	all  int
+	game map[string]int
+}
+
+// Parses "1" or "1,hearts=2": a version for all games, then any per game.
+func parseMinVersions(text string) (minVersions, error) {
+	mv := minVersions{game: map[string]int{}}
+	for _, part := range strings.Split(text, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kind, num, per := strings.Cut(part, "=")
+		if !per {
+			num = kind
+		}
+		v, err := strconv.Atoi(num)
+		if err != nil || v < 0 || (per && !kindRe.MatchString(kind)) {
+			return mv, fmt.Errorf("bad version %q", part)
+		}
+		if per {
+			mv.game[kind] = v
+		} else {
+			mv.all = v
+		}
+	}
+	return mv, nil
+}
+
+func (mv minVersions) of(kind string) int {
+	if v, ok := mv.game[kind]; ok {
+		return v
+	}
+	return mv.all
 }
 
 type game struct {
@@ -100,8 +143,8 @@ type client struct {
 	invites map[string]time.Time
 }
 
-func newServer(idle time.Duration) *server {
-	return &server{games: map[string]*game{}, clients: map[*client]struct{}{}, idle: idle}
+func newServer(idle time.Duration, min minVersions) *server {
+	return &server{games: map[string]*game{}, clients: map[*client]struct{}{}, idle: idle, min: min}
 }
 
 func (s *server) serve(l net.Listener) error {
@@ -237,6 +280,11 @@ func (s *server) handle(c *client, m *msg) bool {
 	switch m.T {
 	case "hello":
 		if c.kind != "" || !kindRe.MatchString(m.Game) {
+			return false
+		}
+		// Too old to make sense of the others' moves: tell it so and hang up.
+		if m.V < s.min.of(m.Game) {
+			c.send(map[string]any{"t": "error", "msg": "update"})
 			return false
 		}
 		c.kind = m.Game
