@@ -29,6 +29,9 @@ const (
 	grace = 2 * time.Minute
 	// How often a player may invite the same player again.
 	inviteGap = 30 * time.Second
+	// The most players and tables sent in one list.
+	maxListedPlayers = 100
+	maxListedGames   = 50
 )
 
 var (
@@ -61,6 +64,10 @@ type server struct {
 	idle time.Duration
 	// The oldest app version let in.
 	min minVersions
+	// Games whose lobby or player list changed since they were last sent,
+	// sent together every `batch` rather than on each change.
+	lobbyDirty, playersDirty map[string]bool
+	batch                    time.Duration
 }
 
 // The oldest app version let in for every game, and for some games on their own.
@@ -144,11 +151,13 @@ type client struct {
 }
 
 func newServer(idle time.Duration, min minVersions) *server {
-	return &server{games: map[string]*game{}, clients: map[*client]struct{}{}, idle: idle, min: min}
+	return &server{games: map[string]*game{}, clients: map[*client]struct{}{}, idle: idle, min: min,
+		lobbyDirty: map[string]bool{}, playersDirty: map[string]bool{}, batch: time.Second}
 }
 
 func (s *server) serve(l net.Listener) error {
 	go s.collect()
+	go s.flush()
 	for {
 		nc, err := l.Accept()
 		if err != nil {
@@ -191,8 +200,25 @@ func (s *server) collect() {
 			}
 		}
 		for kind := range changed {
+			s.lobbiesChanged(kind)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// Sends the lobbies and player lists that changed, at most once a batch, so
+// a busy lobby costs a message per player per batch rather than per change.
+func (s *server) flush() {
+	for range time.Tick(s.batch) {
+		s.mu.Lock()
+		for kind := range s.lobbyDirty {
 			s.sendLobbies(kind)
 		}
+		for kind := range s.playersDirty {
+			s.sendPlayers(kind)
+		}
+		clear(s.lobbyDirty)
+		clear(s.playersDirty)
 		s.mu.Unlock()
 	}
 }
@@ -268,7 +294,7 @@ func (s *server) close(c *client) {
 	close(c.out)
 	delete(s.clients, c)
 	if c.kind != "" {
-		s.sendPlayers(c.kind)
+		s.playersChanged(c.kind)
 	}
 }
 
@@ -303,7 +329,7 @@ func (s *server) handle(c *client, m *msg) bool {
 		}
 		c.send(map[string]any{"t": "welcome", "token": c.token})
 		c.send(s.lobby(c))
-		s.sendPlayers(c.kind)
+		s.playersChanged(c.kind)
 	case "ping":
 		c.send(map[string]any{"t": "pong"})
 	case "name":
@@ -311,13 +337,13 @@ func (s *server) handle(c *client, m *msg) bool {
 		if g := c.game; g != nil {
 			g.seats[c.seat].name = c.name
 			s.sendTable(g)
-			s.sendLobbies(g.kind)
+			s.lobbiesChanged(g.kind)
 		} else {
-			s.sendPlayers(c.kind)
+			s.playersChanged(c.kind)
 		}
 	case "visible":
 		c.hidden = !m.On
-		s.sendPlayers(c.kind)
+		s.playersChanged(c.kind)
 	case "invite":
 		s.invite(c, m.ID)
 	case "create":
@@ -352,7 +378,7 @@ func (s *server) handle(c *client, m *msg) bool {
 		}
 		g.started = true
 		s.sendTable(g)
-		s.sendLobbies(g.kind)
+		s.lobbiesChanged(g.kind)
 	case "bot":
 		g := c.game
 		if g == nil || !g.started || s.admin(g) != c.seat || m.Seat < 0 || m.Seat >= len(g.seats) {
@@ -454,7 +480,7 @@ func (s *server) sit(c *client, g *game, i int) {
 	}
 	s.sendTable(g)
 	c.send(map[string]any{"t": "log", "acts": acts})
-	s.sendLobbies(g.kind)
+	s.lobbiesChanged(g.kind)
 }
 
 // Takes the client from its table. A player who leaves before the start
@@ -475,7 +501,7 @@ func (s *server) leave(c *client, explicit bool) {
 		g.empty = time.Now()
 	}
 	s.sendTable(g)
-	s.sendLobbies(g.kind)
+	s.lobbiesChanged(g.kind)
 }
 
 // Empties a seat before the start, passing the table on if its creator goes
@@ -584,7 +610,36 @@ func (s *server) lobby(c *client) map[string]any {
 			"mine":    mine,
 		})
 	}
+	// Your own tables first, then those still waiting for players.
+	rank := func(g map[string]any) int {
+		if g["mine"].(bool) {
+			return 0
+		}
+		if !g["started"].(bool) {
+			return 1
+		}
+		return 2
+	}
+	sort.SliceStable(games, func(i, j int) bool {
+		if ri, rj := rank(games[i]), rank(games[j]); ri != rj {
+			return ri < rj
+		}
+		return games[i]["id"].(string) < games[j]["id"].(string)
+	})
+	if len(games) > maxListedGames {
+		games = games[:maxListedGames]
+	}
 	return map[string]any{"t": "lobby", "games": games}
+}
+
+// A table of the kind changed: who sits where, and so who is free to invite.
+func (s *server) lobbiesChanged(kind string) {
+	s.lobbyDirty[kind] = true
+	s.playersDirty[kind] = true
+}
+
+func (s *server) playersChanged(kind string) {
+	s.playersDirty[kind] = true
 }
 
 // To everyone of the kind not at a table.
@@ -594,12 +649,10 @@ func (s *server) sendLobbies(kind string) {
 			c.send(s.lobby(c))
 		}
 	}
-	s.sendPlayers(kind)
 }
 
-// The players in the lobby who can be invited, to everyone of the kind who
-// could invite them or might like to know: those in the lobby and at tables
-// not yet started.
+// The players in the lobby who can be invited, to those who can invite them:
+// everyone of the kind at a table not yet started.
 func (s *server) sendPlayers(kind string) {
 	type player struct {
 		ID   string `json:"id"`
@@ -614,12 +667,12 @@ func (s *server) sendPlayers(kind string) {
 	}
 	sort.Slice(free, func(i, j int) bool { return free[i].Name < free[j].Name })
 	for c := range s.clients {
-		if c.kind != kind || c.closed || (c.game != nil && c.game.started) {
+		if c.kind != kind || c.closed || c.game == nil || c.game.started {
 			continue
 		}
 		others := []player{}
 		for _, p := range free {
-			if p.c != c {
+			if p.c != c && len(others) < maxListedPlayers {
 				others = append(others, p)
 			}
 		}

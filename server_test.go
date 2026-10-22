@@ -20,7 +20,9 @@ func start(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go newServer(time.Hour, minVersions{all: 1, game: map[string]int{"bridge": 2}}).serve(l)
+	s := newServer(time.Hour, minVersions{all: 1, game: map[string]int{"bridge": 2}})
+	s.batch = 20 * time.Millisecond
+	go s.serve(l)
 	return l.Addr().String()
 }
 
@@ -252,6 +254,37 @@ func TestParseMinVersions(t *testing.T) {
 	for _, bad := range []string{"x", "hearts=", "Hearts=2", "-1"} {
 		if _, err := parseMinVersions(bad); err == nil {
 			t.Errorf("%q parsed", bad)
+		}
+	}
+}
+
+func TestListsAreBatchedAndCapped(t *testing.T) {
+	addr := start(t)
+	// Someone in the lobby gets table lists but no player lists.
+	idle, _ := dial(t, addr, "Idle", "")
+	host, _ := dial(t, addr, "Host", "")
+	host.send(map[string]any{"t": "create", "seats": 2})
+	host.expect("table")
+	host.expect("players")
+	for i := 0; i < maxListedGames+5; i++ {
+		c, _ := dial(t, addr, "Many", "")
+		c.send(map[string]any{"t": "create", "seats": 2})
+		c.expect("table")
+	}
+	// Read everything Idle got until the full lobby: no player list among it.
+	idle.nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		line, err := idle.r.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		json.Unmarshal(line, &m)
+		if m["t"] == "players" {
+			t.Fatal("player list sent to someone in the lobby")
+		}
+		if m["t"] == "lobby" && len(m["games"].([]any)) == maxListedGames {
+			break
 		}
 	}
 }
