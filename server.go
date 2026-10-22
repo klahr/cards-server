@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,8 @@ const (
 	readTimeout = 45 * time.Second // clients ping every 15 seconds
 	// How long a seat is held for a player whose connection dropped before the start.
 	grace = 2 * time.Minute
+	// How often a player may invite the same player again.
+	inviteGap = 30 * time.Second
 )
 
 var (
@@ -43,6 +46,7 @@ type msg struct {
 	Seats    int             `json:"seats,omitempty"`
 	Seat     int             `json:"seat,omitempty"`
 	On       bool            `json:"on,omitempty"`
+	Hidden   bool            `json:"hidden,omitempty"`
 	A        json.RawMessage `json:"a,omitempty"`
 }
 
@@ -63,6 +67,8 @@ type game struct {
 	log     []json.RawMessage
 	// When the last player went away; zero while someone is at the table.
 	empty time.Time
+	// Tokens of the players invited, who may sit down without the password.
+	invited map[string]bool
 }
 
 type seat struct {
@@ -86,6 +92,12 @@ type client struct {
 	kind   string // the card game the client plays; empty until hello
 	game   *game
 	seat   int
+	// Others see this instead of the token, which would let them take the seat.
+	id string
+	// Left out of the list of players others can invite.
+	hidden bool
+	// When this client last invited each player, by id.
+	invites map[string]time.Time
 }
 
 func newServer(idle time.Duration) *server {
@@ -99,7 +111,7 @@ func (s *server) serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		c := &client{srv: s, nc: nc, out: make(chan []byte, 256)}
+		c := &client{srv: s, nc: nc, out: make(chan []byte, 256), invites: map[string]time.Time{}}
 		s.mu.Lock()
 		s.clients[c] = struct{}{}
 		s.mu.Unlock()
@@ -212,6 +224,9 @@ func (s *server) close(c *client) {
 	c.closed = true
 	close(c.out)
 	delete(s.clients, c)
+	if c.kind != "" {
+		s.sendPlayers(c.kind)
+	}
 }
 
 // Returns false to hang up on the client.
@@ -226,6 +241,8 @@ func (s *server) handle(c *client, m *msg) bool {
 		}
 		c.kind = m.Game
 		c.name = cleanName(m.Name)
+		c.hidden = m.Hidden
+		c.id = randomHex(4)
 		c.token = m.Token
 		if !tokenRe.MatchString(c.token) {
 			c.token = randomHex(16)
@@ -238,6 +255,7 @@ func (s *server) handle(c *client, m *msg) bool {
 		}
 		c.send(map[string]any{"t": "welcome", "token": c.token})
 		c.send(s.lobby(c))
+		s.sendPlayers(c.kind)
 	case "ping":
 		c.send(map[string]any{"t": "pong"})
 	case "name":
@@ -246,7 +264,14 @@ func (s *server) handle(c *client, m *msg) bool {
 			g.seats[c.seat].name = c.name
 			s.sendTable(g)
 			s.sendLobbies(g.kind)
+		} else {
+			s.sendPlayers(c.kind)
 		}
+	case "visible":
+		c.hidden = !m.On
+		s.sendPlayers(c.kind)
+	case "invite":
+		s.invite(c, m.ID)
 	case "create":
 		if m.Seats < 2 || m.Seats > maxSeats {
 			c.fail("bad seats")
@@ -331,7 +356,7 @@ func (s *server) join(c *client, m *msg) {
 			free = i
 		}
 	}
-	if g.password != "" && subtle.ConstantTimeCompare([]byte(g.password), []byte(m.Password)) != 1 {
+	if g.password != "" && !g.invited[c.token] && subtle.ConstantTimeCompare([]byte(g.password), []byte(m.Password)) != 1 {
 		c.fail("wrong password")
 		return
 	}
@@ -340,7 +365,35 @@ func (s *server) join(c *client, m *msg) {
 		return
 	}
 	s.leave(c, true)
+	delete(g.invited, c.token)
 	s.sit(c, g, free)
+}
+
+// Asks a player in the lobby to the inviter's table, which must not have started.
+func (s *server) invite(c *client, id string) {
+	g := c.game
+	if g == nil || g.started {
+		return
+	}
+	var to *client
+	for o := range s.clients {
+		if o.id == id && o.kind == c.kind && o.game == nil && !o.hidden {
+			to = o
+		}
+	}
+	if to == nil {
+		c.fail("no such player")
+		return
+	}
+	if time.Since(c.invites[id]) < inviteGap {
+		return
+	}
+	c.invites[id] = time.Now()
+	if g.invited == nil {
+		g.invited = map[string]bool{}
+	}
+	g.invited[to.token] = true
+	to.send(map[string]any{"t": "invited", "id": g.id, "title": g.title, "from": c.name})
 }
 
 func (s *server) sit(c *client, g *game, i int) {
@@ -492,6 +545,37 @@ func (s *server) sendLobbies(kind string) {
 		if c.kind == kind && c.game == nil {
 			c.send(s.lobby(c))
 		}
+	}
+	s.sendPlayers(kind)
+}
+
+// The players in the lobby who can be invited, to everyone of the kind who
+// could invite them or might like to know: those in the lobby and at tables
+// not yet started.
+func (s *server) sendPlayers(kind string) {
+	type player struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		c    *client
+	}
+	var free []player
+	for c := range s.clients {
+		if c.kind == kind && c.game == nil && !c.hidden && !c.closed {
+			free = append(free, player{ID: c.id, Name: c.name, c: c})
+		}
+	}
+	sort.Slice(free, func(i, j int) bool { return free[i].Name < free[j].Name })
+	for c := range s.clients {
+		if c.kind != kind || c.closed || (c.game != nil && c.game.started) {
+			continue
+		}
+		others := []player{}
+		for _, p := range free {
+			if p.c != c {
+				others = append(others, p)
+			}
+		}
+		c.send(map[string]any{"t": "players", "players": others})
 	}
 }
 

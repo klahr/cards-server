@@ -179,3 +179,42 @@ func TestDropBeforeStartKeepsSeat(t *testing.T) {
 		t.Fatalf("rejoined %v", table)
 	}
 }
+
+func TestInvite(t *testing.T) {
+	addr := start(t)
+	a, _ := dial(t, addr, "Ann", "")
+	a.send(map[string]any{"t": "create", "seats": 4, "password": "secret"})
+	table := a.expect("table")
+
+	b, _ := dial(t, addr, "Bob", "")
+	// Bob shows up in the list Ann sees at her table.
+	list := a.until("players", func(m map[string]any) bool { return len(m["players"].([]any)) == 1 })
+	bob := list["players"].([]any)[0].(map[string]any)
+	if bob["name"] != "Bob" || bob["id"] == "" {
+		t.Fatalf("players: %v", list)
+	}
+
+	// Someone hidden is left out.
+	h, _ := dial(t, addr, "Hid", "")
+	h.send(map[string]any{"t": "visible", "on": false})
+	a.until("players", func(m map[string]any) bool { return len(m["players"].([]any)) == 1 })
+
+	a.send(map[string]any{"t": "invite", "id": bob["id"]})
+	inv := b.expect("invited")
+	if inv["id"] != table["id"] || inv["from"] != "Ann" {
+		t.Fatalf("invited: %v", inv)
+	}
+	// The invitation stands in for the password.
+	b.send(map[string]any{"t": "join", "id": inv["id"]})
+	if seat := b.expect("table")["seat"]; seat != 1.0 {
+		t.Fatalf("seat %v", seat)
+	}
+	// At the table, Bob is no longer in the list.
+	a.until("players", func(m map[string]any) bool { return len(m["players"].([]any)) == 0 })
+
+	// Without an invitation, the password still holds.
+	h.send(map[string]any{"t": "join", "id": table["id"]})
+	if msg := h.expect("error")["msg"]; msg != "wrong password" {
+		t.Fatalf("error %v", msg)
+	}
+}
